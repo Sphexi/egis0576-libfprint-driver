@@ -1,18 +1,35 @@
 # libfprint driver for EgisTec EH576 (USB 1c7a:0576)
 
+> **Use at your own risk.** This driver was developed and tested on a single
+> Lenovo Yoga laptop. It has not been tested on any other hardware. It may or
+> may not work for you, and could behave unexpectedly on other machines or
+> kernel versions. No warranty is provided — see [LICENSE](LICENSE).
+
+> **Vibe-coded with Claude.** This entire driver — from USB protocol
+> reverse-engineering through NBIS image pipeline debugging to the mirror-padding
+> fix — was developed interactively with
+> [Claude Sonnet](https://claude.ai) (Anthropic) using Claude Code. The human
+> provided the hardware, USB captures, test feedback, and direction; Claude
+> wrote and debugged the C code, diagnosed the NBIS minutiae failure, and
+> authored the documentation. This is an experiment in AI-assisted low-level
+> systems programming.
+
+---
+
 A [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) driver for the
-LighTuning/EgisTec EH576 optical fingerprint sensor, found in several Lenovo
-ThinkPad laptop models (e.g. ThinkPad E14 Gen 2 AMD).
+LighTuning/EgisTec EH576 optical fingerprint sensor, found in some Lenovo
+Yoga and ThinkPad laptop models.
 
 ## Status
 
-Functional. Enrollment, verification, and PAM integration all work reliably.
+Functional on the tested hardware. Enrollment, verification, and PAM
+integration all work reliably on one Lenovo Yoga running Kubuntu 24.04.
 
 ## Supported hardware
 
-| USB ID | Device | Notes |
-|--------|--------|-------|
-| `1c7a:0576` | LighTuning EgisTec EH576 | Confirmed working |
+| USB ID | Device | Tested on |
+|--------|--------|-----------|
+| `1c7a:0576` | LighTuning EgisTec EH576 | Lenovo Yoga (Kubuntu 24.04) |
 
 To check if you have this sensor:
 
@@ -34,7 +51,7 @@ See [INSTALL.md](INSTALL.md) for full build instructions. In brief:
 # Clone libfprint and apply the patch
 git clone https://gitlab.freedesktop.org/libfprint/libfprint.git
 cd libfprint
-git apply /path/to/patches/0001-libfprint-Add-driver-for-EgisTec-EH576-fingerprint-s.patch
+git apply /path/to/egis0576-driver/patches/0001-libfprint-Add-driver-for-EgisTec-EH576-fingerprint-s.patch
 
 # Build and install
 meson setup builddir
@@ -75,3 +92,17 @@ for a full explanation.
 | `tests/test_fingerprint.py` | Interactive acceptance test |
 | `INSTALL.md` | Build and installation guide |
 | `TECHNICAL.md` | How the image pipeline works and why |
+
+## Development
+
+Developed in a single extended session using [Claude Code](https://claude.ai/claude-code)
+(Claude Sonnet 4.6, Anthropic). The session covered:
+
+- USB protocol analysis from Windows driver captures
+- Raw image quality analysis (DFT simulation, NCC correlation, ASCII ridge visualisation)
+- NBIS pipeline debugging (direction map validity, binarization analysis, minutiae removal tracing)
+- Discovery and fix of the NBIS border-block INVALID_DIR problem via mirror padding
+- bozorth3 threshold tuning from live score data
+- PAM integration and acceptance testing
+
+Co-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>
