@@ -97,11 +97,17 @@ for a full explanation.
 
 This driver stands on the shoulders of earlier work:
 
-- **[egis0575](https://github.com/Animeshz/linux-scripts) by Animesh Sahu**
-  (`Copyright (C) 2021 Animesh Sahu <animeshsahu19@yahoo.com>`) — the direct
-  protocol ancestor. The EH576 USB command sequence was adapted from this driver,
-  which was itself reverse-engineered from Windows driver USB captures by
-  [Animeshz](https://github.com/Animeshz) and Pengu601.
+- **[Animeshz/EgisTec-EH575](https://github.com/Animeshz/EgisTec-EH575)** by
+  Animesh Sahu — an archive of reverse-engineering efforts for the closely related
+  EH575 (1c7a:0575) sensor, including a libfprint patch and USB traffic findings.
+  The EGIS/SIGE command framing and register-write/capture sequence used in this
+  driver were derived from that work.
+
+- **[Pengu601/EgisTec-EH576](https://github.com/Pengu601/EgisTec-EH576)** by
+  Pengu601 — an independent EH576 reverse-engineering effort using Wireshark and
+  Ghidra to analyse the Windows user-mode driver (`CRealTekDeviceCtrlForET576`).
+  Provided USB protocol captures and command-sequence analysis specific to the
+  1c7a:0576 device.
 
 - **[egis0570](https://gitlab.freedesktop.org/libfprint/libfprint/-/blob/master/libfprint/drivers/egis0570.c)
   in libfprint upstream** by Maxim Kolesnikov and Saeed/Ali Rk — used as a
