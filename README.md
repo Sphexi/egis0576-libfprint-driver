@@ -93,6 +93,20 @@ for a full explanation.
 | `INSTALL.md` | Build and installation guide |
 | `TECHNICAL.md` | How the image pipeline works and why |
 
+## Acknowledgements
+
+This driver stands on the shoulders of earlier work:
+
+- **[egis0575](https://github.com/Animeshz/linux-scripts) by Animesh Sahu**
+  (`Copyright (C) 2021 Animesh Sahu <animeshsahu19@yahoo.com>`) — the direct
+  protocol ancestor. The EH576 USB command sequence was adapted from this driver,
+  which was itself reverse-engineered from Windows driver USB captures by
+  [Animeshz](https://github.com/Animeshz) and Pengu601.
+
+- **[egis0570](https://gitlab.freedesktop.org/libfprint/libfprint/-/blob/master/libfprint/drivers/egis0570.c)
+  in libfprint upstream** by Maxim Kolesnikov and Saeed/Ali Rk — used as a
+  structural reference for the libfprint FpImageDevice driver framework.
+
 ## Development
 
 Developed in a single extended session using [Claude Code](https://claude.ai/claude-code)
