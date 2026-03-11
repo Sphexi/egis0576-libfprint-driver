@@ -215,10 +215,16 @@ static const Packet EGIS0576_REPEAT_PACKETS[] = {
 #define EGIS0576_CONSECUTIVE_CAPTURES 1
 
 /* Minimum mean pixel value to accept a frame as containing a finger.
- * After PRE_INIT calibration, an empty sensor returns near-zero mean;
- * a real fingerprint produces mean ≈ 53 (measured by USB capture).
- * Threshold of 30 filters out barely-touched frames (mean ~10-20). */
-#define EGIS0576_MIN_MEAN 30
+ * After SOFTWARE background subtraction, an empty sensor returns mean ≈ 1;
+ * a light touch produces mean ≈ 11-20; a firm press gives mean ≈ 30-50.
+ * Threshold of 12 accepts any reasonable touch while rejecting empty frames. */
+#define EGIS0576_MIN_MEAN 12
+
+/* Threshold for finger-OFF detection (hysteresis).
+ * Must be well below MIN_MEAN to prevent frame-to-frame noise from
+ * falsely triggering finger-off while the finger is still down.
+ * No-finger frames have mean ≈ 1; even the lightest graze gives ≈ 11. */
+#define EGIS0576_FINGER_OFF_MEAN 5
 
 /* Ridge-contrast quality threshold, expressed as a fraction (NUM/DEN).
  *
@@ -271,10 +277,10 @@ static const Packet EGIS0576_REPEAT_PACKETS[] = {
 #define EGIS0576_BZ3_THRESHOLD 10
 
 /* Number of enrollment stages.  The EH576 active area is only ~3.5×2.6 mm;
- * a 2-3 mm shift in finger placement between captures results in completely
- * non-overlapping image regions.  Seven stages give libfprint seven
- * independent XYT templates, improving the probability that at least one
- * overlaps the verify capture.  (Same approach as the elanspi driver.) */
-#define EGIS0576_ENROLL_STAGES 7
+ * a 1-2 mm shift in finger placement between captures results in mostly
+ * non-overlapping image regions.  Ten stages give libfprint ten
+ * independent XYT templates covering different positions across the
+ * fingertip, balancing coverage against enrollment convenience. */
+#define EGIS0576_ENROLL_STAGES 10
 
 #define EGIS0576_TIMEOUT 10000  /* ms */

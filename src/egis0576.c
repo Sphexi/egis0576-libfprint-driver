@@ -53,6 +53,15 @@ struct _FpDeviceEgis0576
   GSList       *strips;      /* collected image strips (fpi_frame*) */
   gsize         strips_len;  /* number of strips collected */
 
+  /* Software background subtraction.
+   *
+   * The EH576 sensor does NOT perform hardware background subtraction
+   * during PRE_INIT calibration — the raw frame always contains a DC
+   * background level of ~103.  We capture the first no-finger frame as
+   * the per-pixel background baseline and subtract it from every
+   * subsequent capture, exactly like the egis0570 driver. */
+  guint8       *background;  /* per-pixel background (IMGWIDTH × RFMGHEIGHT), or NULL */
+
   /* Current packet array being walked */
   const Packet *pkt_array;
   int           pkt_array_len;
@@ -120,27 +129,21 @@ valid_data (FpiUsbTransfer *transfer)
 }
 
 /*
- * finger_present: returns TRUE when the mean pixel value in the frame
- * exceeds EGIS0576_MIN_MEAN.
+ * finger_present: returns TRUE when the mean pixel value in the
+ * background-subtracted active-pixel buffer exceeds EGIS0576_MIN_MEAN.
  *
- * After PRE_INIT calibration the sensor returns near-zero data when no
- * finger is present (background-subtracted baseline).  A real fingerprint
- * push raises the mean to ≈53 (measured by USB capture with a finger).
- * Mean-based detection is simpler and more reliable than variance for this
- * sensor; it matches the approach used by the egis0570 driver.
+ * After software background subtraction, no-finger frames have near-zero
+ * mean while a real fingerprint produces mean ≈ 30–60.
  */
 static gboolean
-finger_present (FpiUsbTransfer *transfer)
+finger_present (const guint8 *frame, guint npix)
 {
-  unsigned char *buf    = transfer->buffer;
-  int            length = transfer->actual_length;
-  double         mean   = 0.0;
+  guint32 sum = 0;
 
-  for (int i = 0; i < length; i++)
-    mean += buf[i];
-  mean /= length;
+  for (guint i = 0; i < npix; i++)
+    sum += frame[i];
 
-  return mean > (double) EGIS0576_MIN_MEAN;
+  return (double) sum / npix > (double) EGIS0576_MIN_MEAN;
 }
 
 /*
@@ -148,29 +151,26 @@ finger_present (FpiUsbTransfer *transfer)
  *
  * Low-contrast "uniform press" frames (no visible ridge structure) pass the
  * finger_present() mean check but produce only spurious edge minutiae in NBIS,
- * corrupting the enrolled template.  We detect them via the ratio mean/max of
- * the active pixel columns: good frames have clear ridges (some pixels much
- * brighter than others) so mean/max is low (~0.60–0.72); uniform-press frames
- * have nearly flat intensity so mean/max approaches 1.0 (~0.88–0.90).
+ * corrupting the enrolled template.  We detect them via the ratio mean/max:
+ * good frames have clear ridges (some pixels much brighter than others) so
+ * mean/max is low (~0.40–0.65); uniform-press frames have nearly flat
+ * intensity so mean/max approaches 1.0.
  *
  * Reject when: mean/max > NUMER/DENOM
  * i.e. when:   sum * DENOM > NUMER * npix * max_val   (integer arithmetic)
  */
 static gboolean
-good_quality (FpiUsbTransfer *transfer)
+good_quality (const guint8 *frame, guint npix)
 {
   guint    max_val = 0;
   guint32  sum     = 0;
-  guint    npix    = EGIS0576_IMGWIDTH * EGIS0576_RFMGHEIGHT;
 
-  for (int row = 0; row < EGIS0576_RFMGHEIGHT; row++)
-    for (int col = 0; col < EGIS0576_IMGWIDTH; col++)
-      {
-        guint8 v = transfer->buffer[(EGIS0576_RFMDIS + row) * EGIS0576_STRIDE + col];
-        if (v > max_val)
-          max_val = v;
-        sum += v;
-      }
+  for (guint i = 0; i < npix; i++)
+    {
+      if (frame[i] > max_val)
+        max_val = frame[i];
+      sum += frame[i];
+    }
 
   if (max_val == 0)
     return FALSE;
@@ -325,12 +325,15 @@ mirror_pad_image (FpImage *src)
 static void
 save_img (FpiUsbTransfer *transfer, FpDevice *dev)
 {
-  FpDeviceEgis0576 *self = FPI_DEVICE_EGIS0576 (dev);
+  FpDeviceEgis0576    *self     = FPI_DEVICE_EGIS0576 (dev);
+  FpImageDevice       *img_self = FP_IMAGE_DEVICE (dev);
+  FpiImageDeviceState  state;
+  guint                npix     = EGIS0576_IMGWIDTH * EGIS0576_RFMGHEIGHT;
 
   if (!valid_data (transfer))
     {
-      /* Sensor returned all-zero data — not calibrated yet or no finger.
-       * Loop back and try the next capture rather than failing the session. */
+      fp_dbg ("Invalid data (all zeros), length=%d — looping back",
+              (int) transfer->actual_length);
       fpi_ssm_jump_to_state (transfer->ssm, SM_REQ);
       return;
     }
@@ -344,41 +347,168 @@ save_img (FpiUsbTransfer *transfer, FpDevice *dev)
       return;
     }
 
-  if (!finger_present (transfer))
+  /*
+   * Extract active pixels from the raw USB buffer into a contiguous
+   * IMGWIDTH × RFMGHEIGHT array, then apply software background subtraction.
+   */
+  guint8 *frame = g_malloc (npix);
+
+  for (int row = 0; row < EGIS0576_RFMGHEIGHT; row++)
+    memcpy (frame + row * EGIS0576_IMGWIDTH,
+            transfer->buffer + (EGIS0576_RFMDIS + row) * EGIS0576_STRIDE,
+            EGIS0576_IMGWIDTH);
+
+  /*
+   * Software background subtraction (like egis0570).
+   *
+   * The EH576 sensor does NOT do hardware background subtraction — every
+   * raw frame contains a DC background level of ~103.  The first uniform
+   * (no-finger) frame becomes our per-pixel background baseline.  All
+   * subsequent frames have the background subtracted, leaving only the
+   * fingerprint ridge/valley signal.
+   */
+  if (!self->background)
     {
-      /* Finger lifted mid-swipe: if we have enough strips, assemble now */
-      if (self->strips_len > 0)
-        goto start_processing;
-    }
-  else if (!good_quality (transfer))
-    {
-      /* Low-contrast "uniform press" frame — no visible ridge structure.
-       * Discard silently and request another capture. */
-      fp_dbg ("Frame rejected: insufficient ridge contrast (low mean/max ratio)");
+      /*
+       * Use the first valid frame unconditionally as the per-pixel
+       * background baseline, exactly like the egis0570 driver.
+       *
+       * The capture sequence starts during POST_INIT (or PRE_INIT)
+       * before the user has placed their finger, so the first frame is
+       * always a no-finger frame.  The sensor's background DC level
+       * varies between activations (mean 101–130, mean/max ratio
+       * 0.62–0.90), making any fixed uniformity threshold unreliable.
+       */
+      guint32 bg_sum = 0;
+      guint   bg_max = 0;
+
+      for (guint i = 0; i < npix; i++)
+        {
+          bg_sum += frame[i];
+          if (frame[i] > bg_max)
+            bg_max = frame[i];
+        }
+
+      self->background = frame;   /* take ownership */
+      fp_dbg ("Background captured (mean=%.1f max=%u ratio=%.3f)",
+              (double) bg_sum / npix, bg_max,
+              bg_max > 0 ? (double) bg_sum / (npix * bg_max) : 0.0);
       fpi_ssm_jump_to_state (transfer->ssm, SM_REQ);
       return;
     }
-  else
+
+  /* Subtract background per-pixel, clamping to zero */
+  for (guint i = 0; i < npix; i++)
     {
-      /* Copy the active pixel columns (EGIS0576_IMGWIDTH = 80) from each of
-       * the RFMGHEIGHT rows.  The raw USB buffer has EGIS0576_STRIDE = 103
-       * bytes per row; we copy only the leftmost IMGWIDTH bytes per row,
-       * discarding the inactive zero-padding columns on the right. */
-      struct fpi_frame *stripe =
-        g_malloc (EGIS0576_IMGWIDTH * EGIS0576_RFMGHEIGHT + sizeof (struct fpi_frame));
-      stripe->delta_x = 0;
-      stripe->delta_y = 0;
-      for (int row = 0; row < EGIS0576_RFMGHEIGHT; row++)
-        memcpy (stripe->data + row * EGIS0576_IMGWIDTH,
-                transfer->buffer + (EGIS0576_RFMDIS + row) * EGIS0576_STRIDE,
-                EGIS0576_IMGWIDTH);
-      self->strips = g_slist_prepend (self->strips, stripe);
-      self->strips_len += 1;
+      if (frame[i] > self->background[i])
+        frame[i] -= self->background[i];
+      else
+        frame[i] = 0;
     }
+
+  /* Diagnostic logging */
+  {
+    guint32 d_sum = 0, d_max = 0;
+    for (guint i = 0; i < npix; i++)
+      {
+        d_sum += frame[i];
+        if (frame[i] > d_max)
+          d_max = frame[i];
+      }
+    g_object_get (dev, "fpi-image-device-state", &state, NULL);
+    fp_dbg ("Frame (bg-sub): mean=%.1f max=%u mean/max=%.3f state=%d",
+            (double) d_sum / npix, d_max,
+            d_max > 0 ? (double) d_sum / (npix * d_max) : 0.0,
+            (int) state);
+  }
+
+  /*
+   * Between enrollment stages or after verification, the image device may
+   * be in AWAIT_FINGER_OFF (waiting for user to lift) or IDLE (between
+   * operations).  Poll until the finger is actually removed, then report
+   * finger-off so libfprint can proceed to the next enrollment stage.
+   *
+   * For enrollment, this means the user must lift and reposition their
+   * finger for each stage.  This is essential: the EH576 active area
+   * is only ~3.5×2.6 mm, so each press captures a tiny region of the
+   * fingerprint.  By enrolling multiple positions, verification has a
+   * much better chance of matching at least one template regardless
+   * of finger placement.
+   */
+  g_object_get (dev, "fpi-image-device-state", &state, NULL);
+  if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF)
+    {
+      /* Use lower FINGER_OFF_MEAN threshold for hysteresis:
+       * finger-on requires mean > MIN_MEAN (12), but finger-off
+       * only triggers when mean drops below FINGER_OFF_MEAN (5).
+       * This prevents frame-to-frame noise from falsely reporting
+       * finger-off while the user is still pressing. */
+      {
+        guint32 foff_sum = 0;
+        for (guint i = 0; i < npix; i++)
+          foff_sum += frame[i];
+        if ((double) foff_sum / npix < (double) EGIS0576_FINGER_OFF_MEAN)
+          {
+            fp_dbg ("Finger lifted — reporting finger-off");
+            fpi_image_device_report_finger_status (img_self, FALSE);
+          }
+      }
+      g_free (frame);
+      fpi_ssm_jump_to_state (transfer->ssm, SM_REQ);
+      return;
+    }
+  if (state == FPI_IMAGE_DEVICE_STATE_IDLE)
+    {
+      g_free (frame);
+      fpi_ssm_jump_to_state (transfer->ssm, SM_REQ);
+      return;
+    }
+
+  if (!finger_present (frame, npix))
+    {
+      g_free (frame);
+      /* Finger not present: if we have enough strips, assemble now */
+      if (self->strips_len > 0)
+        goto start_processing;
+      fpi_ssm_jump_to_state (transfer->ssm, SM_REQ);
+      return;
+    }
+
+  if (!good_quality (frame, npix))
+    {
+      fp_dbg ("Frame REJECTED: insufficient ridge contrast");
+      g_free (frame);
+      fpi_ssm_jump_to_state (transfer->ssm, SM_REQ);
+      return;
+    }
+
+  fp_dbg ("Frame ACCEPTED: saving strip");
+
+  /* Save the RAW (non-bg-subtracted) frame for NBIS processing.
+   *
+   * Background subtraction is used only for finger detection and quality
+   * checks above.  For NBIS minutiae extraction, we pass the raw image
+   * with its natural DC background (~103).  This avoids creating sharp
+   * zero-valued boundaries between the finger contact area and the
+   * non-contact area, which would cause NBIS to find spurious boundary
+   * minutiae whose positions vary with each press (bozorth3 score 0). */
+  {
+    struct fpi_frame *stripe =
+      g_malloc (npix + sizeof (struct fpi_frame));
+    stripe->delta_x = 0;
+    stripe->delta_y = 0;
+    for (int row = 0; row < EGIS0576_RFMGHEIGHT; row++)
+      memcpy (stripe->data + row * EGIS0576_IMGWIDTH,
+              transfer->buffer + (EGIS0576_RFMDIS + row) * EGIS0576_STRIDE,
+              EGIS0576_IMGWIDTH);
+    self->strips = g_slist_prepend (self->strips, stripe);
+    self->strips_len += 1;
+  }
+
+  g_free (frame);
 
   if (self->strips_len < EGIS0576_CONSECUTIVE_CAPTURES)
     {
-      /* Need more frames: loop back to send next command sequence */
       fpi_ssm_jump_to_state (transfer->ssm, SM_REQ);
       return;
     }
@@ -401,85 +531,85 @@ process_imgs (FpiSsm *ssm, FpDevice *dev)
   fpi_image_device_report_finger_status (img_self, TRUE);
 
   g_object_get (dev, "fpi-image-device-state", &state, NULL);
-  if (state == FPI_IMAGE_DEVICE_STATE_CAPTURE)
+  if (state == FPI_IMAGE_DEVICE_STATE_CAPTURE && !self->stop)
     {
-      if (!self->stop)
-        {
-          g_autoptr(FpImage) img = NULL;
+      g_autoptr(FpImage) img = NULL;
 
-          self->strips = g_slist_reverse (self->strips);
-          fpi_do_movement_estimation (&assembling_ctx, self->strips);
-          img = fpi_assemble_frames (&assembling_ctx, self->strips);
+      self->strips = g_slist_reverse (self->strips);
+      fpi_do_movement_estimation (&assembling_ctx, self->strips);
+      img = fpi_assemble_frames (&assembling_ctx, self->strips);
 
-          /* Normalize image to the full 0-255 dynamic range.
-           *
-           * The sensor returns background-subtracted values; with a typical
-           * press the max pixel value is only ~130 out of 255.  After
-           * FPI_IMAGE_COLORS_INVERTED the ridges end up at ~125 (light gray)
-           * instead of 0 (black), which severely limits NBIS minutiae
-           * detection.  Stretching to full range maps ridges to 255 in raw
-           * (→ 0 = black after inversion) and gives NBIS the contrast it needs.
-           *
-           * The no-finger region (raw = 0) is not affected by this scaling
-           * because we scale by max, not by (max-min): zeros stay at zero and
-           * invert to 255 (white background) as expected.
-           */
-          {
-            guint8 *data    = img->data;
-            guint   npix    = img->width * img->height;
-            guint8  max_val = 0;
+      /* Normalize image to the full 0-255 dynamic range.
+       *
+       * The sensor returns background-subtracted values; with a typical
+       * press the max pixel value is only ~130 out of 255.  After
+       * FPI_IMAGE_COLORS_INVERTED the ridges end up at ~125 (light gray)
+       * instead of 0 (black), which severely limits NBIS minutiae
+       * detection.  Stretching to full range maps ridges to 255 in raw
+       * (→ 0 = black after inversion) and gives NBIS the contrast it needs.
+       *
+       * The no-finger region (raw = 0) is not affected by this scaling
+       * because we scale by max, not by (max-min): zeros stay at zero and
+       * invert to 255 (white background) as expected.
+       */
+      {
+        guint8 *data    = img->data;
+        guint   npix    = img->width * img->height;
+        guint8  max_val = 0;
 
-            for (guint i = 0; i < npix; i++)
-              if (data[i] > max_val)
-                max_val = data[i];
+        for (guint i = 0; i < npix; i++)
+          if (data[i] > max_val)
+            max_val = data[i];
 
-            if (max_val > 0 && max_val < 255)
-              for (guint i = 0; i < npix; i++)
-                data[i] = (guint8) ((data[i] * 255u) / max_val);
-          }
+        if (max_val > 0 && max_val < 255)
+          for (guint i = 0; i < npix; i++)
+            data[i] = (guint8) ((data[i] * 255u) / max_val);
+      }
 
-          /* Enhance local ridge/valley contrast before passing to NBIS. */
-          apply_unsharp_mask (img->data, img->width, img->height);
+      /* Enhance local ridge/valley contrast before passing to NBIS. */
+      apply_unsharp_mask (img->data, img->width, img->height);
 
-          /* FPI_IMAGE_COLORS_INVERTED: after normalization, ridges are bright
-           * (255) and valleys/background are dark (0 or low).  Inversion maps
-           * ridges → 0 (black) and background → 255 (white), the convention
-           * NBIS/mindtct expects for minutiae extraction.
-           *
-           * Do NOT set FPI_IMAGE_PARTIAL: that flag causes NBIS to call
-           * remove_perimeter_pts=TRUE, which REMOVES minutiae within 10 px of
-           * the fingerprint data boundary.  For our small sensor those perimeter
-           * minutiae are valid and essential for a successful match.  The default
-           * (no PARTIAL) is remove_perimeter_pts=FALSE — keep all minutiae.
-           */
-          img->flags |= FPI_IMAGE_COLORS_INVERTED;
+      /* FPI_IMAGE_COLORS_INVERTED: after normalization, ridges are bright
+       * (255) and valleys/background are dark (0 or low).  Inversion maps
+       * ridges → 0 (black) and background → 255 (white), the convention
+       * NBIS/mindtct expects for minutiae extraction.
+       *
+       * Do NOT set FPI_IMAGE_PARTIAL: that flag causes NBIS to call
+       * remove_perimeter_pts=TRUE, which REMOVES minutiae within 10 px of
+       * the fingerprint data boundary.  For our small sensor those perimeter
+       * minutiae are valid and essential for a successful match.  The default
+       * (no PARTIAL) is remove_perimeter_pts=FALSE — keep all minutiae.
+       */
+      img->flags |= FPI_IMAGE_COLORS_INVERTED;
 
-          /* 2× upscale (EGIS0576_RESIZE=2): ridges widen from ~1–2 px to ~2–4 px,
-           * giving NBIS a more stable ridge skeleton after binarisation+thinning.
-           * Without upscale the 1-pixel-wide ridges at 68×52 produce a fragmented
-           * skeleton with almost no detectable minutiae.
-           * ppmm = (500 × RESIZE)/25.4 keeps bozorth3 distances in physical mm. */
-          FpImage *resized = fpi_image_resize (img, EGIS0576_RESIZE, EGIS0576_RESIZE);
-          resized->ppmm = (500.0 * EGIS0576_RESIZE) / 25.4;
+      /* 2× upscale (EGIS0576_RESIZE=2): ridges widen from ~1–2 px to ~2–4 px,
+       * giving NBIS a more stable ridge skeleton after binarisation+thinning.
+       * Without upscale the 1-pixel-wide ridges at 68×52 produce a fragmented
+       * skeleton with almost no detectable minutiae.
+       * ppmm = (500 × RESIZE)/25.4 keeps bozorth3 distances in physical mm. */
+      FpImage *resized = fpi_image_resize (img, EGIS0576_RESIZE, EGIS0576_RESIZE);
+      resized->ppmm = (500.0 * EGIS0576_RESIZE) / 25.4;
 
-          /* Mirror-pad the resized image so NBIS border blocks see real ridge
-           * structure and are marked VALID by the DFT direction map.  Without
-           * this, all ridges terminating at the image border are removed as
-           * "near-invalid-block" artifacts, leaving only 1–2 interior minutiae.
-           * See mirror_pad_image() for a detailed explanation. */
-          FpImage *padded = mirror_pad_image (resized);
-          g_object_unref (resized);
+      /* Mirror-pad the resized image so NBIS border blocks see real ridge
+       * structure and are marked VALID by the DFT direction map.  Without
+       * this, all ridges terminating at the image border are removed as
+       * "near-invalid-block" artifacts, leaving only 1–2 interior minutiae.
+       * See mirror_pad_image() for a detailed explanation. */
+      FpImage *padded = mirror_pad_image (resized);
+      g_object_unref (resized);
 
-          fpi_image_device_image_captured (img_self, padded);
-        }
-
-      g_slist_free_full (self->strips, g_free);
-      self->strips     = NULL;
-      self->strips_len = 0;
-
-      fpi_image_device_report_finger_status (img_self, FALSE);
-      fpi_ssm_next_state (ssm);  /* -> SM_DONE */
+      fpi_image_device_image_captured (img_self, padded);
     }
+
+  /* Always clean up strips and advance the SSM, regardless of device state.
+   * Do NOT report finger-off here — save_img() detects actual finger removal
+   * by polling in the AWAIT_FINGER_OFF state, giving the user time to lift
+   * and reposition between enrollment stages. */
+  g_slist_free_full (self->strips, g_free);
+  self->strips     = NULL;
+  self->strips_len = 0;
+
+  fpi_ssm_next_state (ssm);  /* -> SM_DONE */
 }
 
 /* ========================================================================= *
@@ -654,6 +784,7 @@ loop_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   FpDeviceEgis0576 *self    = FPI_DEVICE_EGIS0576 (dev);
 
   self->running = FALSE;
+  g_clear_pointer (&self->background, g_free);
 
   if (error)
     fpi_image_device_session_error (img_dev, error);

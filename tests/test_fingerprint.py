@@ -32,18 +32,19 @@ def run_verify():
 
 
 def run_enroll():
-    print(f"  Enrolling {FINGER} for {USER}...")
+    print(f"  Deleting any existing prints for {USER}...")
     subprocess.run(["fprintd-delete", USER], capture_output=True)
+    print(f"  Enrolling {FINGER} for {USER}...")
+    print("  (Tap the sensor multiple times, shifting finger position each time)")
     result = subprocess.run(
         ["fprintd-enroll", "-f", FINGER, USER],
-        capture_output=True, text=True
+        text=True
     )
-    if "enroll-completed" in result.stdout + result.stderr:
+    if result.returncode == 0:
         print("  Enrollment complete ✓")
         return True
     else:
         print("  Enrollment FAILED ✗")
-        print(result.stdout + result.stderr)
         return False
 
 
